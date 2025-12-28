@@ -224,9 +224,9 @@ class QwenRAGSystem:
                 raw_data = json.load(f)
             
             logger.info(f"加载了 {len(raw_data)} 条原始数据")
-            
+            MAX_RECORDS = 10
             # 处理每条记录
-            for i, item in enumerate(raw_data):
+            for i, item in enumerate(raw_data[:MAX_RECORDS]):
                 try:
                     # 创建数据记录
                     record = DataRecord(
@@ -259,84 +259,145 @@ class QwenRAGSystem:
         except Exception as e:
             logger.error(f"数据加载失败: {e}")
             return False
-    
+    #####
+
+    def init_vectorstore(self):
+        logger.info("【INIT】进入 init_vectorstore")
+
+        embedding_model = DashScopeEmbeddings(model="text-embedding-v1")
+        VECTORSTORE_DIR = "./vectorstore/faiss_qwen"
+
+        if os.path.exists(VECTORSTORE_DIR):
+            logger.info("【INIT】检测到已有向量数据库，直接加载")
+            self.vectorstore = FAISS.load_local(
+                VECTORSTORE_DIR,
+                embedding_model,
+                allow_dangerous_deserialization=True
+            )
+            return True
+
+        logger.info("【INIT】未检测到向量数据库，开始构建")
+        success = self.build_vectorstore()
+        if not success:
+            logger.error("【INIT】build_vectorstore 失败")
+            return False
+
+        os.makedirs(VECTORSTORE_DIR, exist_ok=True)
+        self.vectorstore.save_local(VECTORSTORE_DIR)
+        logger.info(f"【INIT】向量数据库已保存到 {VECTORSTORE_DIR}")
+
+        return True
+
+    #######
     def build_vectorstore(self) -> bool:
         """
-        构建向量数据库
-        
-        Returns:
-            bool: 是否成功
+        构建向量数据库（稳定版）
+        - 分批 embedding
+        - 严格校验
+        - 统一 embedding 对象
         """
         try:
             all_chunks = []
-            chunk_to_record_map = {}
-            
-            # 收集所有文本块
+            metadatas = []
+
+            # ========= 1. 收集文本块 =========
             for record in self.data_records:
-                for chunk in record.questionTitle_chunks + record.questionText_chunks + record.answerText_chunks:
-                    if chunk.content.strip():  # 只处理非空内容
-                        all_chunks.append(chunk.content)
-                        chunk_to_record_map[chunk.content] = {
-                            'record': record,
-                            'chunk_type': chunk.chunk_type,
-                            'chunk_index': len(all_chunks) - 1
-                        }
-            
+                for chunk in (
+                        record.questionTitle_chunks
+                        + record.questionText_chunks
+                        + record.answerText_chunks
+                ):
+                    text = chunk.content.strip()
+                    if not text:
+                        continue
+
+                    all_chunks.append(text)
+                    metadatas.append({
+                        "record_index": record.index,
+                        "chunk_type": chunk.chunk_type,
+                        "original_text": text[:100] + "..." if len(text) > 100 else text
+                    })
+
             if not all_chunks:
-                logger.error("没有有效的文本块用于构建向量数据库")
+                logger.error("没有有效文本块，向量数据库构建终止")
                 return False
-            
-            # 创建embedding并构建向量数据库
-            logger.info(f"为 {len(all_chunks)} 个文本块创建embedding...")
-            embeddings = self.embeddings.embed_documents(all_chunks)
-            
-            # 创建FAISS向量数据库
-            # 1. 先构造 text_embeddings（用你已有的 all_chunks 和 embeddings）
+
+            logger.info(f"共收集 {len(all_chunks)} 个文本块，开始创建 embedding...")
+
+            # ========= 2. 初始化 embedding 模型 =========
             embedding_model = DashScopeEmbeddings(model="text-embedding-v1")
-            zero_vector = [0.0] * 768  # 通义千问嵌入向量维度为768，按需调整
 
-            # 第二步：替换空文本对应的向量
-            processed_embeddings = []
-            for text, emb in zip(all_chunks, embeddings):
-                if not text.strip():
-                    processed_embeddings.append(zero_vector)
-                else:
-                    processed_embeddings.append(emb)
+            # ========= 3. 分批 embedding =========
+            import concurrent.futures
+            import time
 
-            # 第三步：后续逻辑不变（构造 text_embeddings 并调用）
-            text_embeddings = list(zip(all_chunks, processed_embeddings))
-            if not text_embeddings:
-                text_embeddings=zero_vector
+            def batch_embed(texts, batch_size=8, timeout=30):
+                all_embeddings = []
+
+                for start in range(0, len(texts), batch_size):
+                    batch = texts[start:start + batch_size]
+
+                    logger.info(f"Embedding batch [{start}:{start + len(batch)}]")
+
+                    try:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(
+                                embedding_model.embed_documents, batch
+                            )
+                            batch_embeddings = future.result(timeout=timeout)
+
+                    except concurrent.futures.TimeoutError:
+                        raise RuntimeError(
+                            f"Embedding 超时（>{timeout}s），batch 起始索引 {start}"
+                        )
+
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Embedding 调用异常，batch 起始索引 {start}"
+                        ) from e
+
+                    if not batch_embeddings or len(batch_embeddings) != len(batch):
+                        raise RuntimeError(
+                            f"Embedding 数量异常，batch 起始索引 {start}"
+                        )
+
+                    all_embeddings.extend(batch_embeddings)
+
+                    time.sleep(0.1)  # 🔥 非常重要：主动限速，避免 QPS 限流
+
+                return all_embeddings
+
+            embeddings = batch_embed(all_chunks, batch_size=32)
+
+            logger.info("Embedding 创建完成，开始构建 FAISS 向量数据库...")
+
+            # ========= 4. 构建 FAISS =========
+            text_embeddings = list(zip(all_chunks, embeddings))
 
             self.vectorstore = FAISS.from_embeddings(
                 text_embeddings=text_embeddings,
                 embedding=embedding_model,
-                metadatas=[{
-                    'record_index': chunk_to_record_map[text]['record'].index,
-                    'chunk_type': chunk_to_record_map[text]['chunk_type'],
-                    'original_text': text[:100] + '...' if len(text) > 100 else text
-                } for text in all_chunks]
+                metadatas=metadatas
             )
 
-            
-            logger.info("向量数据库构建完成")
+            logger.info("向量数据库构建成功")
             return True
-            
+
         except Exception as e:
-            logger.error(f"向量数据库构建失败: {e}")
+            logger.exception(f"向量数据库构建失败: {e}")
             return False
     
-    def _calculate_cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """计算余弦相似度"""
-        try:
-            dot_product = np.dot(vec1, vec2)
-            norm1 = np.linalg.norm(vec1)
-            norm2 = np.linalg.norm(vec2)
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-            return float(dot_product / (norm1 * norm2))
-        except:
-            return 0.0
+    # def _calculate_cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+    #     """计算余弦相似度"""
+    #     try:
+    #         dot_product = np.dot(vec1, vec2)
+    #         norm1 = np.linalg.norm(vec1)
+    #         norm2 = np.linalg.norm(vec2)
+    #         if norm1 == 0 or norm2 == 0:
+    #             return 0.0
+    #         return float(dot_product / (norm1 * norm2))
+    #     except:
+    #         return 0.0
     
     def _query_rewrite(self, query: str) -> str:
         """
@@ -368,103 +429,79 @@ class QwenRAGSystem:
         return self.retrieval_config.title_weight, \
                self.retrieval_config.question_weight, \
                self.retrieval_config.answer_weight
-    
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        搜索相关文档
-        
-        Args:
-            query: 查询文本
-            top_k: 返回前k个结果
-            
-        Returns:
-            List[Dict]: 搜索结果列表
-        """
-        if not self.vectorstore:
-            logger.error("向量数据库未构建，请先调用build_vectorstore()")
-            return []
-        
+
+    def search(self, query: str, top_k: int = 5):
         try:
-            # 查询重写
             rewritten_query = self._query_rewrite(query)
             logger.info(f"原始查询: {query}")
             logger.info(f"重写查询: {rewritten_query}")
-            
-            # 为查询创建embedding
-            query_embedding = np.array(self.embeddings.embed_query(rewritten_query))
-            
-            # 获取所有向量和元数据
-            all_embeddings = self.vectorstore.index.reconstruct_n(0, self.vectorstore.index.ntotal)
-            metadatas = self.vectorstore.metadatas
-            
-            # 计算相似度
+
+            docs_with_scores = self.vectorstore.similarity_search_with_score(
+                rewritten_query,
+                k=top_k * 5
+            )
+
             record_scores = {}
-            
-            for i, metadata in enumerate(metadatas):
-                record_index = metadata['record_index']
-                chunk_type = metadata['chunk_type']
-                
+
+            for doc, score in docs_with_scores:
+                metadata = doc.metadata
+                record_index = metadata["record_index"]
+                chunk_type = metadata["chunk_type"]
+
                 if record_index not in record_scores:
                     record_scores[record_index] = {
-                        'record': None,
-                        'title_similarities': [],
-                        'question_similarities': [],
-                        'answer_similarities': []
+                        "record": self.data_records[record_index],
+                        "title_similarities": [],
+                        "question_similarities": [],
+                        "answer_similarities": []
                     }
-                
-                # 计算相似度
-                doc_embedding = np.array(all_embeddings[i])
-                similarity = self._calculate_cosine_similarity(query_embedding, doc_embedding)
-                
-                # 分类存储相似度
-                if chunk_type == 'title':
-                    record_scores[record_index]['title_similarities'].append(similarity)
-                elif chunk_type == 'question':
-                    record_scores[record_index]['question_similarities'].append(similarity)
-                elif chunk_type == 'answer':
-                    record_scores[record_index]['answer_similarities'].append(similarity)
-            
-            # 计算每条记录的最终相似度
+
+                # FAISS 返回的是距离（越小越相似），转成相似度
+                similarity = (1.0 / (1.0 + score))*100000
+
+                if chunk_type == "title":
+                    record_scores[record_index]["title_similarities"].append(similarity)
+                elif chunk_type == "question":
+                    record_scores[record_index]["question_similarities"].append(similarity)
+                elif chunk_type == "answer":
+                    record_scores[record_index]["answer_similarities"].append(similarity)
+
             final_scores = []
-            
-            for record_index, scores_data in record_scores.items():
-                record = self.data_records[record_index]
-                
-                # 计算各部分的平均相似度
-                title_avg = np.mean(scores_data['title_similarities']) if scores_data['title_similarities'] else 0.0
-                question_avg = np.mean(scores_data['question_similarities']) if scores_data['question_similarities'] else 0.0
-                answer_avg = np.mean(scores_data['answer_similarities']) if scores_data['answer_similarities'] else 0.0
-                
-                # 获取自适应权重
-                title_weight, question_weight, answer_weight = self._adaptive_similarity_weights(query, record)
-                
-                # 计算最终相似度
-                final_similarity = (
-                    title_weight * title_avg +
-                    question_weight * question_avg +
-                    answer_weight * answer_avg
+
+            for record_index, data in record_scores.items():
+                title_avg = np.mean(data["title_similarities"]) if data["title_similarities"] else 0.0
+                question_avg = np.mean(data["question_similarities"]) if data["question_similarities"] else 0.0
+                answer_avg = np.mean(data["answer_similarities"]) if data["answer_similarities"] else 0.0
+
+                title_w, question_w, answer_w = self._adaptive_similarity_weights(
+                    query, data["record"]
                 )
-                
+
+                final_similarity = (
+                        title_w * title_avg +
+                        question_w * question_avg +
+                        answer_w * answer_avg
+                )
+
                 final_scores.append({
-                    'record_index': record_index,
-                    'record': record,
-                    'final_similarity': final_similarity,
-                    'title_similarity': title_avg,
-                    'question_similarity': question_avg,
-                    'answer_similarity': answer_avg,
-                    'title_weight': title_weight,
-                    'question_weight': question_weight,
-                    'answer_weight': answer_weight
+                    "record_index": record_index,
+                    "record": data["record"],
+                    "final_similarity": final_similarity,
+                    "title_similarity": title_avg,
+                    "question_similarity": question_avg,
+                    "answer_similarity": answer_avg,
+                    "title_weight": title_w,
+                    "question_weight": question_w,
+                    "answer_weight": answer_w
                 })
-            
-            # 排序并返回前k个结果
-            final_scores.sort(key=lambda x: x['final_similarity'], reverse=True)
+
+            final_scores.sort(key=lambda x: x["final_similarity"], reverse=True)
             return final_scores[:top_k]
-            
+
         except Exception as e:
-            logger.error(f"搜索失败: {e}")
+            logger.exception(f"搜索失败: {e}")
             return []
-    
+
     def generate_response(self, query: str, top_k: int = 5) -> str:
         """
         生成回答
@@ -495,43 +532,45 @@ class QwenRAGSystem:
                 context_parts.append("-" * 50)
             
             context = "\n".join(context_parts)
-            
+
             # 构建提示词
             prompt = f"""基于以下上下文信息，回答用户的问题。请根据上下文内容提供准确、有用的回答。
 
-上下文信息:
-{context}
+            上下文信息:
+            {context}
 
-用户问题: {query}
+            用户问题: {query}
 
-请基于上述上下文信息回答用户的问题。如果上下文信息不足，请说明并提供一般性的建议。"""
-            
+            请基于上述上下文信息回答用户的问题。如果上下文信息不足，请说明并提供一般性的建议。
+            """
+
             # 生成回答
             if ALIBABA_CLOUD_AVAILABLE and hasattr(self, 'dashscope'):
                 try:
-                    # 使用DashScope原生API生成回答
                     response = self.dashscope.Generation.call(
                         model=self.llm_model,
-                        input={'messages': [{'role': 'user', 'content': prompt}]},
+                        prompt=prompt,
                         temperature=0.1,
                         max_tokens=2000
                     )
+
                     if response and hasattr(response, 'output') and hasattr(response.output, 'text'):
                         return response.output.text.strip()
                     else:
                         return "抱歉，模型生成失败"
+
                 except Exception as e:
-                    logger.error(f"DashScope调用失败: {e}")
+                    logger.exception(f"DashScope调用失败: {e}")
                     return f"抱歉，模型调用失败: {e}"
             else:
-                # 如果没有LLM，返回基于检索结果的摘要
                 best_result = search_results[0]
                 return f"基于相似度最高的回答：\n{best_result['record'].answerText}"
-            
+
+
         except Exception as e:
             logger.error(f"生成回答失败: {e}")
             return f"抱歉，回答生成失败: {e}"
-    
+
     def get_retrieval_stats(self) -> Dict[str, Any]:
         """获取检索统计信息"""
         if not self.data_records:
@@ -583,20 +622,23 @@ def main():
     
     # 构建向量数据库
     print("正在构建向量数据库...")
-    if not rag.build_vectorstore():
+    ok = rag.init_vectorstore()
+    print("init_vectorstore 返回值:", ok)
+
+    if not ok:
         print("向量数据库构建失败")
         return
-    
+
     # 显示统计信息
     stats = rag.get_retrieval_stats()
     print("\n系统统计信息:")
     for key, value in stats.items():
         print(f"{key}: {value}")
     
-    # 搜索测试
+     # 搜索测试
     query = "什么是恐慌发作？"
     print(f"\n测试查询: {query}")
-    
+
     # 检索相关文档
     search_results = rag.search(query, top_k=3)
     print(f"\n找到 {len(search_results)} 个相关结果:")
