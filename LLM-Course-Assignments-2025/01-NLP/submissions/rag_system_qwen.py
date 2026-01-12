@@ -4,19 +4,24 @@
 基于阿里云通义千问的RAG系统实现
 支持多层级文本切片、语义检索和相似度计算
 """
-
+import hashlib
 import json
 import os
+import random
+
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 
+import requests
+from dashscope import Generation
+from dashscope.api_entities.dashscope_response import GenerationResponse
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 import logging
-
+from deep_translator import GoogleTranslator
 # 尝试导入阿里云相关组件
 try:
     import dashscope
@@ -77,9 +82,9 @@ class DashScopeEmbeddingWrapper:
 @dataclass
 class RetrievalConfig:
     """检索配置类"""
-    title_weight: float = 0.6
-    question_weight: float = 0.4
-    answer_weight: float = 0.0
+    title_weight: float = 0.5
+    question_weight: float = 0.35
+    answer_weight: float = 0.15
     
     def normalize_weights(self):
         """标准化权重"""
@@ -500,7 +505,55 @@ class QwenRAGSystem:
                self.retrieval_config.question_weight, \
                self.retrieval_config.answer_weight
 
+
     def search(self, query: str, top_k: int = 5):
+
+        def translate_to_english(text):
+            """
+            使用qwen-turbo API将中文文本翻译为英文
+            :param text: 待翻译的中文文本
+            :return: 翻译后的英文文本（失败返回原文本）
+            """
+            # 空文本直接返回
+            if not text or text.strip() == "":
+                logger.warning("待翻译文本为空，直接返回")
+                return text
+
+            # 构造翻译提示词（精准引导qwen返回纯英文翻译结果）
+            prompt = f"""
+            你的唯一任务是将以下文本精准翻译为地道的英文，无需额外解释、说明或补充内容，仅返回翻译结果：
+            待翻译文本：{text}
+            """
+
+            try:
+                # 调用qwen-turbo API
+                response: GenerationResponse = Generation.call(
+                    model=self.llm_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    result_format='text',  # 直接返回文本结果，无需解析JSON
+                    temperature=0.1,  # 低温度保证翻译结果稳定
+                    max_tokens=1024,  # 限制返回长度，适配短文本翻译
+                    timeout=10  # 设置超时时间，避免程序卡住
+                )
+
+                # 解析响应结果
+                if response.status_code == 200:
+                    translated_text = response.output.text.strip()
+                    logger.info(f"翻译成功：{text[:100]} -> {translated_text[:100]}")
+                    return translated_text
+                else:
+                    logger.error(f"qwen-turbo API调用失败，状态码：{response.status_code}，信息：{response.message}")
+                    return text
+
+            except Exception as e:
+                logger.error(f"翻译异常：{text}，错误信息：{str(e)}")
+                return text
+
         try:
             rewritten = self._query_rewrite(query)
             logger.info(f"原始查询: {query}")
@@ -514,11 +567,21 @@ class QwenRAGSystem:
                 }
 
             sub_queries = rewritten.get("sub_queries", [])
+            # 原始查询的子查询项
+            original_sub_query = {"text": query, "weight": 0.5}
 
             total_weight = sum(s.get("weight", 0) for s in sub_queries)
             if total_weight > 0:
                 for s in sub_queries:
-                    s["weight"] /= total_weight
+                    s["weight"] = (s["weight"] / total_weight) * 0.5
+
+            sub_queries.insert(0, original_sub_query)
+
+            for idx, sub_query in enumerate(sub_queries):
+                original_text = sub_query.get("text", "")
+                if original_text:
+                    translated_text = translate_to_english(original_text)
+                    sub_query["text"] = translated_text  # 替换为英文
 
             record_scores = {}
             seen_chunks = {}
@@ -599,6 +662,9 @@ class QwenRAGSystem:
                 })
 
             final_scores.sort(key=lambda x: x["final_similarity"], reverse=True)
+
+
+
             return final_scores[:top_k]
 
         except Exception as e:
@@ -711,7 +777,7 @@ def main():
         llm_model="qwen-turbo",
         chunk_size=500,
         chunk_overlap=100,
-        retrieval_config=RetrievalConfig(title_weight=0.6, question_weight=0.4, answer_weight=0.0)
+        retrieval_config=RetrievalConfig(title_weight=0.5, question_weight=0.35, answer_weight=0.15)
     )
     
     # 数据路径

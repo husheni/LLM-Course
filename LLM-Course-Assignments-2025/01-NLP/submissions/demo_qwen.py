@@ -29,6 +29,7 @@ def create_sample_queries():
     sample_queries = [
         "心理健康问题的症状有哪些？",
         "抑郁症的治疗方法是什么？",
+        "我幼年被陌生人强暴，导致我无法信任他人，现在也无法跟妻子有正常的性生活",
         "如何帮助有心理疾病的朋友？"
     ]
     return sample_queries
@@ -36,7 +37,7 @@ def create_sample_queries():
 def demo_rag_system():
     """RAG系统演示"""
     print("="*80)
-    print("阿里云通义千问RAG系统演示")
+    print("心理健康问答RAG系统演示")
     print("="*80)
     
     # 检查环境
@@ -60,12 +61,12 @@ def demo_rag_system():
             chunk_size=500,
             chunk_overlap=100,
             retrieval_config=RetrievalConfig(
-                title_weight=0.6,
-                question_weight=0.4,
-                answer_weight=0.0
+                title_weight=0.5,
+                question_weight=0.35,
+                answer_weight=0.15
             )
         )
-        
+
         # 加载和处理数据
         print("正在加载和处理数据...")
         if not rag.load_and_process_data(data_path):
@@ -99,18 +100,19 @@ def demo_rag_system():
             print("-" * 50)
             
             # 检索相关文档
-            search_results = rag.search(query, top_k=3)
+            search_results = rag.search(query, top_k=5)
             
             if search_results:
                 print(f"找到 {len(search_results)} 个相关结果:")
                 for j, result in enumerate(search_results, 1):
                     print(f"  结果 {j} (相似度: {result['final_similarity']:.3f}):")
                     print(f"    问题: {result['record'].questionTitle}")
+                    print(f"    问题文本: {result['record'].questionText[:100]}")
                     print(f"    回答预览: {result['record'].answerText[:100]}...")
                 
                 # 生成回答
                 print("\n  生成的回答:")
-                response = rag.generate_response(query, top_k=3)
+                response = rag.generate_response(query, top_k=5)
                 print(f"  {response[:400]}{'...' if len(response) > 400 else ''}")
             else:
                 print("  未找到相关结果")
@@ -136,17 +138,18 @@ def demo_rag_system():
                     continue
                 
                 print("\n正在检索...")
-                search_results = rag.search(user_query, top_k=3)
+                search_results = rag.search(user_query, top_k=5)
                 
                 if search_results:
                     print(f"找到 {len(search_results)} 个相关结果:")
                     for j, result in enumerate(search_results, 1):
                         print(f"  结果 {j} (相似度: {result['final_similarity']:.3f}):")
                         print(f"    问题: {result['record'].questionTitle}")
+                        print(f"    问题文本预览: {result['record'].questionText[:150]}...")
                         print(f"    回答预览: {result['record'].answerText[:150]}...")
                     
                     print("\n生成的回答:")
-                    response = rag.generate_response(user_query, top_k=3)
+                    response = rag.generate_response(user_query, top_k=5)
                     print(f"  {response}")
                 else:
                     print("  未找到相关结果")
